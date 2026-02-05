@@ -39,11 +39,17 @@ NHL_API_BASE = "https://api-web.nhle.com/v1"
 # Contract configuration
 CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS", "")
 BASE_RPC_URL = os.getenv("BASE_RPC_URL", "https://mainnet.base.org")
+OWNER_PRIVATE_KEY = os.getenv("OWNER_PRIVATE_KEY", "")
 
 # Web3 setup
 w3 = Web3(Web3.HTTPProvider(BASE_RPC_URL))
 
-# Contract ABI (minimal for reading)
+# Get owner account from private key
+owner_account = None
+if OWNER_PRIVATE_KEY:
+    owner_account = w3.eth.account.from_key(OWNER_PRIVATE_KEY)
+
+# Contract ABI (includes settleContest for auto-settlement)
 PUCKPOT_ABI = [
     {
         "inputs": [{"name": "contestId", "type": "uint256"}],
@@ -70,6 +76,28 @@ PUCKPOT_ABI = [
         "name": "hasEntered",
         "outputs": [{"name": "", "type": "bool"}],
         "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "contestId", "type": "uint256"},
+            {"name": "results", "type": "uint8[]"},
+            {"name": "highestScoringGameGoals", "type": "uint256"}
+        ],
+        "name": "settleContest",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "contestId", "type": "uint256"},
+            {"name": "lockTime", "type": "uint256"},
+            {"name": "numGames", "type": "uint8"}
+        ],
+        "name": "createContest",
+        "outputs": [],
+        "stateMutability": "nonpayable",
         "type": "function"
     }
 ]
@@ -156,10 +184,94 @@ async def lifespan(app: FastAPI):
     # Startup
     scheduler.add_job(update_live_scores, 'interval', minutes=1, id='live_scores')
     scheduler.add_job(check_contests_to_settle, 'interval', minutes=5, id='check_settle')
+    scheduler.add_job(auto_create_daily_contest, 'interval', hours=1, id='auto_create')
     scheduler.start()
+    # Run auto-create immediately on startup
+    await auto_create_daily_contest()
     yield
     # Shutdown
     scheduler.shutdown()
+
+async def auto_create_daily_contest():
+    """Automatically create today's contest on the blockchain if it doesn't exist"""
+    if not CONTRACT_ADDRESS or not owner_account:
+        print("Cannot auto-create contest: CONTRACT_ADDRESS or OWNER_PRIVATE_KEY not configured")
+        return
+
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        contest_id = int(today.replace("-", ""))
+
+        # Check if contest already exists on-chain
+        contract_data = await get_contract_data(contest_id)
+        if contract_data.get("entrant_count", 0) > 0 or contract_data.get("state") != "open":
+            # Contest exists or has entries
+            return
+
+        # Fetch today's schedule
+        schedule = await fetch_nhl_schedule(today)
+        games = parse_games_from_schedule(schedule, today)
+
+        if not games:
+            print(f"No games scheduled for {today}, skipping contest creation")
+            return
+
+        # Check if contract has this contest
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(CONTRACT_ADDRESS),
+            abi=PUCKPOT_ABI
+        )
+
+        try:
+            result = contract.functions.getContest(contest_id).call()
+            lock_time_onchain = result[0]
+            if lock_time_onchain > 0:
+                print(f"Contest {contest_id} already exists on-chain")
+                return
+        except:
+            pass  # Contest doesn't exist, we'll create it
+
+        # Lock time = 5 minutes before first game
+        lock_time = games[0].start_time - timedelta(minutes=5)
+        lock_timestamp = int(lock_time.timestamp())
+
+        # Only create if lock time is in the future
+        if lock_timestamp <= int(datetime.now(timezone.utc).timestamp()):
+            print(f"Lock time already passed for contest {contest_id}")
+            return
+
+        print(f"Creating contest {contest_id} with {len(games)} games, lock time: {lock_time}")
+
+        # Build transaction
+        nonce = w3.eth.get_transaction_count(owner_account.address)
+
+        tx = contract.functions.createContest(
+            contest_id,
+            lock_timestamp,
+            len(games)
+        ).build_transaction({
+            'from': owner_account.address,
+            'nonce': nonce,
+            'gas': 200000,
+            'gasPrice': w3.eth.gas_price * 2,
+            'chainId': 8453
+        })
+
+        # Sign and send
+        signed_tx = w3.eth.account.sign_transaction(tx, owner_account.key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+        print(f"Contest creation tx sent: {tx_hash.hex()}")
+
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+        if receipt.status == 1:
+            print(f"Contest {contest_id} created successfully!")
+        else:
+            print(f"Contest creation failed for {contest_id}")
+
+    except Exception as e:
+        print(f"Error auto-creating contest: {e}")
 
 app = FastAPI(title="PuckPot API", lifespan=lifespan)
 
@@ -306,7 +418,7 @@ async def update_live_scores():
         print(f"Error updating live scores: {e}")
 
 async def check_contests_to_settle():
-    """Check for contests that can be settled"""
+    """Check for contests that can be settled and auto-settle them"""
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         contest_id = int(today.replace("-", ""))
@@ -322,15 +434,86 @@ async def check_contests_to_settle():
         final_results = db.query(GameResultDB).filter(
             GameResultDB.contest_id == contest_id,
             GameResultDB.is_final == True
-        ).count()
+        ).all()
 
-        if final_results == num_games and num_games > 0:
+        if len(final_results) == num_games and num_games > 0:
+            # Check if contract is already settled
+            contract_data = await get_contract_data(contest_id)
+            if contract_data["state"] == "settled":
+                print(f"Contest {contest_id} already settled on-chain")
+                db.close()
+                return
+
             print(f"Contest {contest_id} ready for settlement - all {num_games} games final")
-            # Settlement would be triggered here by the contract owner
+
+            # Auto-settle the contest on-chain
+            await auto_settle_contest(contest_id, final_results, db)
 
         db.close()
     except Exception as e:
         print(f"Error checking contests: {e}")
+
+async def auto_settle_contest(contest_id: int, results: list, db):
+    """Automatically settle a contest on the blockchain"""
+    if not CONTRACT_ADDRESS or not owner_account:
+        print("Cannot auto-settle: CONTRACT_ADDRESS or OWNER_PRIVATE_KEY not configured")
+        return
+
+    try:
+        # Sort results by game_index and build results array
+        results_sorted = sorted(results, key=lambda r: r.game_index)
+        results_array = [r.winner for r in results_sorted]
+
+        # Calculate highest scoring game total goals
+        highest_total = 0
+        for r in results_sorted:
+            if r.home_score is not None and r.away_score is not None:
+                total = r.home_score + r.away_score
+                if total > highest_total:
+                    highest_total = total
+
+        print(f"Settling contest {contest_id}")
+        print(f"  Results: {results_array}")
+        print(f"  Highest scoring game total: {highest_total}")
+
+        # Build and send transaction
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(CONTRACT_ADDRESS),
+            abi=PUCKPOT_ABI
+        )
+
+        # Get nonce
+        nonce = w3.eth.get_transaction_count(owner_account.address)
+
+        # Build transaction
+        tx = contract.functions.settleContest(
+            contest_id,
+            results_array,
+            highest_total
+        ).build_transaction({
+            'from': owner_account.address,
+            'nonce': nonce,
+            'gas': 500000,
+            'gasPrice': w3.eth.gas_price * 2,  # Pay 2x for faster confirmation
+            'chainId': 8453  # Base mainnet
+        })
+
+        # Sign and send
+        signed_tx = w3.eth.account.sign_transaction(tx, owner_account.key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+        print(f"Settlement tx sent: {tx_hash.hex()}")
+
+        # Wait for confirmation
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+
+        if receipt.status == 1:
+            print(f"Contest {contest_id} settled successfully! Block: {receipt.blockNumber}")
+        else:
+            print(f"Settlement transaction failed for contest {contest_id}")
+
+    except Exception as e:
+        print(f"Error auto-settling contest {contest_id}: {e}")
 
 # API Endpoints
 @app.get("/")
