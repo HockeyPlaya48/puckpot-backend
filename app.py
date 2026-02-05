@@ -99,6 +99,28 @@ PUCKPOT_ABI = [
         "outputs": [],
         "stateMutability": "nonpayable",
         "type": "function"
+    },
+    {
+        "inputs": [{"name": "contestId", "type": "uint256"}],
+        "name": "getEntrants",
+        "outputs": [{"name": "", "type": "address[]"}],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {"name": "contestId", "type": "uint256"},
+            {"name": "player", "type": "address"}
+        ],
+        "name": "getEntry",
+        "outputs": [
+            {"name": "picks", "type": "uint8[]"},
+            {"name": "tiebreakerGuess", "type": "uint256"},
+            {"name": "correctPicks", "type": "uint8"},
+            {"name": "tiebreakerDiff", "type": "uint256"}
+        ],
+        "stateMutability": "view",
+        "type": "function"
     }
 ]
 
@@ -185,12 +207,74 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(update_live_scores, 'interval', minutes=1, id='live_scores')
     scheduler.add_job(check_contests_to_settle, 'interval', minutes=5, id='check_settle')
     scheduler.add_job(auto_create_daily_contest, 'interval', hours=1, id='auto_create')
+    scheduler.add_job(sync_entries_from_blockchain, 'interval', minutes=2, id='sync_entries')
     scheduler.start()
-    # Run auto-create immediately on startup
+    # Run auto-create and sync immediately on startup
     await auto_create_daily_contest()
+    await sync_entries_from_blockchain()
     yield
     # Shutdown
     scheduler.shutdown()
+
+async def sync_entries_from_blockchain():
+    """Sync entries from blockchain to database (in case frontend recording failed)"""
+    if not CONTRACT_ADDRESS:
+        return
+
+    try:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        contest_id = int(today.replace("-", ""))
+
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(CONTRACT_ADDRESS),
+            abi=PUCKPOT_ABI
+        )
+
+        # Get all entrants from blockchain
+        try:
+            entrants = contract.functions.getEntrants(contest_id).call()
+        except Exception as e:
+            # Contest might not exist yet
+            return
+
+        if not entrants:
+            return
+
+        db = SessionLocal()
+
+        for wallet_address in entrants:
+            # Check if already in database
+            existing = db.query(EntryDB).filter(
+                EntryDB.contest_id == contest_id,
+                EntryDB.wallet_address == wallet_address.lower()
+            ).first()
+
+            if existing:
+                continue
+
+            # Get entry details from blockchain
+            try:
+                entry_data = contract.functions.getEntry(contest_id, wallet_address).call()
+                picks = [int(p) for p in entry_data[0]]
+                tiebreaker_guess = int(entry_data[1])
+
+                # Record in database
+                new_entry = EntryDB(
+                    contest_id=contest_id,
+                    wallet_address=wallet_address.lower(),
+                    picks=picks,
+                    tiebreaker_guess=tiebreaker_guess,
+                    tx_hash="synced_from_blockchain"
+                )
+                db.add(new_entry)
+                db.commit()
+                print(f"Synced entry from blockchain: {wallet_address} for contest {contest_id}")
+            except Exception as e:
+                print(f"Error syncing entry for {wallet_address}: {e}")
+
+        db.close()
+    except Exception as e:
+        print(f"Error syncing entries from blockchain: {e}")
 
 async def auto_create_daily_contest():
     """Automatically create today's contest on the blockchain if it doesn't exist"""
