@@ -485,8 +485,10 @@ async def update_live_scores():
                 continue
 
             try:
-                scores = await fetch_nhl_scores(date_str)
+                # Use schedule endpoint (includes scores) - more reliable than /score for historical dates
+                scores = await fetch_nhl_schedule(date_str)
                 games = parse_games_from_schedule(scores, date_str)
+                print(f"Found {len(games)} games for {date_str}")
 
                 for game in games:
                     # Update or create game result
