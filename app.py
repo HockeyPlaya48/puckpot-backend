@@ -223,56 +223,63 @@ async def sync_entries_from_blockchain():
 
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        contest_id = int(today.replace("-", ""))
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(CONTRACT_ADDRESS),
             abi=PUCKPOT_ABI
         )
 
-        # Get all entrants from blockchain
-        try:
-            entrants = contract.functions.getEntrants(contest_id).call()
-        except Exception as e:
-            # Contest might not exist yet
-            return
+        # Try today's contest first, then yesterday's if today has no entries
+        contest_ids_to_check = [
+            int(today.replace("-", "")),
+            int(yesterday.replace("-", ""))
+        ]
 
-        if not entrants:
-            return
-
-        db = SessionLocal()
-
-        for wallet_address in entrants:
-            # Check if already in database
-            existing = db.query(EntryDB).filter(
-                EntryDB.contest_id == contest_id,
-                EntryDB.wallet_address == wallet_address.lower()
-            ).first()
-
-            if existing:
+        for contest_id in contest_ids_to_check:
+            # Get all entrants from blockchain
+            try:
+                entrants = contract.functions.getEntrants(contest_id).call()
+            except Exception as e:
+                # Contest might not exist
                 continue
 
-            # Get entry details from blockchain
-            try:
-                entry_data = contract.functions.getEntry(contest_id, wallet_address).call()
-                picks = [int(p) for p in entry_data[0]]
-                tiebreaker_guess = int(entry_data[1])
+            if not entrants:
+                continue
 
-                # Record in database
-                new_entry = EntryDB(
-                    contest_id=contest_id,
-                    wallet_address=wallet_address.lower(),
-                    picks=picks,
-                    tiebreaker_guess=tiebreaker_guess,
-                    tx_hash="synced_from_blockchain"
-                )
-                db.add(new_entry)
-                db.commit()
-                print(f"Synced entry from blockchain: {wallet_address} for contest {contest_id}")
-            except Exception as e:
-                print(f"Error syncing entry for {wallet_address}: {e}")
+            db = SessionLocal()
 
-        db.close()
+            for wallet_address in entrants:
+                # Check if already in database
+                existing = db.query(EntryDB).filter(
+                    EntryDB.contest_id == contest_id,
+                    EntryDB.wallet_address == wallet_address.lower()
+                ).first()
+
+                if existing:
+                    continue
+
+                # Get entry details from blockchain
+                try:
+                    entry_data = contract.functions.getEntry(contest_id, wallet_address).call()
+                    picks = [int(p) for p in entry_data[0]]
+                    tiebreaker_guess = int(entry_data[1])
+
+                    # Record in database
+                    new_entry = EntryDB(
+                        contest_id=contest_id,
+                        wallet_address=wallet_address.lower(),
+                        picks=picks,
+                        tiebreaker_guess=tiebreaker_guess,
+                        tx_hash="synced_from_blockchain"
+                    )
+                    db.add(new_entry)
+                    db.commit()
+                    print(f"Synced entry from blockchain: {wallet_address} for contest {contest_id}")
+                except Exception as e:
+                    print(f"Error syncing entry for {wallet_address}: {e}")
+
+            db.close()
     except Exception as e:
         print(f"Error syncing entries from blockchain: {e}")
 
