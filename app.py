@@ -466,79 +466,100 @@ async def get_contract_data(contest_id: int) -> dict:
 
 # Background Jobs
 async def update_live_scores():
-    """Poll NHL API for live score updates"""
+    """Poll NHL API for live score updates (checks today and yesterday's contests)"""
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        scores = await fetch_nhl_scores(today)
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Check both today and yesterday (for timezone edge cases)
+        dates_to_check = [today, yesterday]
 
         db = SessionLocal()
-        contest_id = int(today.replace("-", ""))
 
-        games = parse_games_from_schedule(scores, today)
+        for date_str in dates_to_check:
+            contest_id = int(date_str.replace("-", ""))
 
-        for game in games:
-            # Update or create game result
-            existing = db.query(GameResultDB).filter(
-                GameResultDB.contest_id == contest_id,
-                GameResultDB.nhl_game_id == game.nhl_game_id
-            ).first()
+            # Check if this contest has entries (worth updating)
+            entry_count = db.query(EntryDB).filter(EntryDB.contest_id == contest_id).count()
+            if entry_count == 0:
+                continue
 
-            if game.status == "FINAL" and game.home_score is not None:
-                winner = 1 if game.home_score > game.away_score else 0
+            try:
+                scores = await fetch_nhl_scores(date_str)
+                games = parse_games_from_schedule(scores, date_str)
 
-                if existing:
-                    existing.home_score = game.home_score
-                    existing.away_score = game.away_score
-                    existing.winner = winner
-                    existing.is_final = True
-                    existing.updated_at = datetime.utcnow()
-                else:
-                    db.add(GameResultDB(
-                        contest_id=contest_id,
-                        game_index=game.game_index,
-                        nhl_game_id=game.nhl_game_id,
-                        home_score=game.home_score,
-                        away_score=game.away_score,
-                        winner=winner,
-                        is_final=True
-                    ))
+                for game in games:
+                    # Update or create game result
+                    existing = db.query(GameResultDB).filter(
+                        GameResultDB.contest_id == contest_id,
+                        GameResultDB.nhl_game_id == game.nhl_game_id
+                    ).first()
 
-        db.commit()
+                    if game.status == "FINAL" and game.home_score is not None:
+                        winner = 1 if game.home_score > game.away_score else 0
+
+                        if existing:
+                            existing.home_score = game.home_score
+                            existing.away_score = game.away_score
+                            existing.winner = winner
+                            existing.is_final = True
+                            existing.updated_at = datetime.utcnow()
+                        else:
+                            db.add(GameResultDB(
+                                contest_id=contest_id,
+                                game_index=game.game_index,
+                                nhl_game_id=game.nhl_game_id,
+                                home_score=game.home_score,
+                                away_score=game.away_score,
+                                winner=winner,
+                                is_final=True
+                            ))
+
+                db.commit()
+            except Exception as e:
+                print(f"Error updating scores for {date_str}: {e}")
+
         db.close()
     except Exception as e:
         print(f"Error updating live scores: {e}")
 
 async def check_contests_to_settle():
-    """Check for contests that can be settled and auto-settle them"""
+    """Check for contests that can be settled and auto-settle them (checks today and yesterday)"""
     try:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        contest_id = int(today.replace("-", ""))
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # Check both today and yesterday's contests
+        contest_ids_to_check = [
+            int(today.replace("-", "")),
+            int(yesterday.replace("-", ""))
+        ]
 
         db = SessionLocal()
-        contest = db.query(ContestDB).filter(ContestDB.id == contest_id).first()
 
-        if not contest:
-            db.close()
-            return
+        for contest_id in contest_ids_to_check:
+            contest = db.query(ContestDB).filter(ContestDB.id == contest_id).first()
 
-        num_games = len(contest.games) if contest.games else 0
-        final_results = db.query(GameResultDB).filter(
-            GameResultDB.contest_id == contest_id,
-            GameResultDB.is_final == True
-        ).all()
+            if not contest:
+                continue
 
-        if len(final_results) == num_games and num_games > 0:
-            # Check if contract is already settled
-            contract_data = await get_contract_data(contest_id)
-            if contract_data["state"] == "settled":
-                print(f"Contest {contest_id} already settled on-chain")
-                db.close()
-                return
+            num_games = len(contest.games) if contest.games else 0
+            final_results = db.query(GameResultDB).filter(
+                GameResultDB.contest_id == contest_id,
+                GameResultDB.is_final == True
+            ).all()
 
-            print(f"Contest {contest_id} ready for settlement - all {num_games} games final")
+            if len(final_results) == num_games and num_games > 0:
+                # Check if contract is already settled
+                contract_data = await get_contract_data(contest_id)
+                if contract_data["state"] == "settled":
+                    print(f"Contest {contest_id} already settled on-chain")
+                    continue
 
-            # Auto-settle the contest on-chain
-            await auto_settle_contest(contest_id, final_results, db)
+                print(f"Contest {contest_id} ready for settlement - all {num_games} games final")
+
+                # Auto-settle the contest on-chain
+                await auto_settle_contest(contest_id, final_results, db)
 
         db.close()
     except Exception as e:
@@ -843,6 +864,13 @@ async def get_user_entry(wallet_address: str, contest_id: int):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+@app.post("/api/admin/sync-scores")
+async def manual_sync_scores():
+    """Manually trigger score sync (for debugging/testing)"""
+    await update_live_scores()
+    await sync_entries_from_blockchain()
+    return {"message": "Scores and entries synced"}
 
 if __name__ == "__main__":
     import uvicorn
