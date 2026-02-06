@@ -606,15 +606,29 @@ async def root():
 
 @app.get("/api/contests/today", response_model=Contest)
 async def get_today_contest():
-    """Get today's contest with games"""
+    """Get today's contest with games (or yesterday's if still active)"""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
     try:
         schedule = await fetch_nhl_schedule(today)
         games = parse_games_from_schedule(schedule, today)
 
+        # If no games today, check if yesterday's contest is still active
         if not games:
-            raise HTTPException(status_code=404, detail="No games scheduled today")
+            yesterday_contest_id = int(yesterday.replace("-", ""))
+            yesterday_contract_data = await get_contract_data(yesterday_contest_id)
+
+            # If yesterday's contest exists and isn't settled, show it
+            if yesterday_contract_data.get("entrant_count", 0) > 0 and yesterday_contract_data.get("state") != "settled":
+                yesterday_schedule = await fetch_nhl_schedule(yesterday)
+                games = parse_games_from_schedule(yesterday_schedule, yesterday)
+                if games:
+                    # Use yesterday's date for the contest
+                    today = yesterday
+
+            if not games:
+                raise HTTPException(status_code=404, detail="No games scheduled today")
 
         # Lock time = 5 minutes before first puck drop
         lock_time = games[0].start_time - timedelta(minutes=5)
