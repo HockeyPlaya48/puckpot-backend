@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 import httpx
 import os
 import json
@@ -26,6 +27,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from web3 import Web3
 
 load_dotenv()
+
+# NHL uses Eastern Time for scheduling — always calculate dates in ET
+EASTERN = ZoneInfo("America/New_York")
+
+def get_et_date(delta_days: int = 0) -> str:
+    """Return YYYY-MM-DD in Eastern Time. delta_days=0 is today, -1 is yesterday."""
+    return (datetime.now(EASTERN) + timedelta(days=delta_days)).strftime("%Y-%m-%d")
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./puckpot.db")
@@ -222,8 +230,8 @@ async def sync_entries_from_blockchain():
         return
 
     try:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        today = get_et_date(0)
+        yesterday = get_et_date(-1)
 
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(CONTRACT_ADDRESS),
@@ -290,7 +298,7 @@ async def auto_create_daily_contest():
         return
 
     try:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = get_et_date(0)
         contest_id = int(today.replace("-", ""))
 
         # Check if contest already exists on-chain
@@ -468,10 +476,10 @@ async def get_contract_data(contest_id: int) -> dict:
 async def update_live_scores():
     """Poll NHL API for live score updates (checks today and yesterday's contests)"""
     try:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        today = get_et_date(0)
+        yesterday = get_et_date(-1)
 
-        # Check both today and yesterday (for timezone edge cases)
+        # Check both today and yesterday
         dates_to_check = [today, yesterday]
 
         db = SessionLocal()
@@ -528,8 +536,8 @@ async def update_live_scores():
 async def check_contests_to_settle():
     """Check for contests that can be settled and auto-settle them (checks today and yesterday)"""
     try:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        today = get_et_date(0)
+        yesterday = get_et_date(-1)
 
         # Check both today and yesterday's contests
         contest_ids_to_check = [
@@ -636,33 +644,54 @@ async def root():
 
 @app.get("/api/contests/today", response_model=Contest)
 async def get_today_contest():
-    """Get today's contest with games (or yesterday's if still active)"""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    """Get the active contest.
+    Uses Eastern Time for dates (NHL schedule timezone).
+    Always shows yesterday's contest while it's unsettled or within 15 min of settlement.
+    Only switches to today's games once the previous contest is fully complete."""
+    et_today = get_et_date(0)
+    et_yesterday = get_et_date(-1)
+    active_date = et_today
 
     try:
-        schedule = await fetch_nhl_schedule(today)
-        games = parse_games_from_schedule(schedule, today)
+        # Step 1: Check if yesterday's ET contest should still be shown.
+        # Keep showing it until: settled on-chain AND 15+ min since last game became final.
+        yesterday_contest_id = int(et_yesterday.replace("-", ""))
+        yesterday_contract_data = await get_contract_data(yesterday_contest_id)
 
-        # If no games today, check if yesterday's contest is still active
+        if yesterday_contract_data.get("entrant_count", 0) > 0:
+            if yesterday_contract_data.get("state") != "settled":
+                # Has entries but not yet settled — keep showing yesterday
+                active_date = et_yesterday
+            else:
+                # Settled — enforce 15-min cooldown before showing tomorrow's picks
+                db = SessionLocal()
+                last_result = db.query(GameResultDB).filter(
+                    GameResultDB.contest_id == yesterday_contest_id,
+                    GameResultDB.is_final == True
+                ).order_by(GameResultDB.updated_at.desc()).first()
+                db.close()
+
+                if last_result and last_result.updated_at:
+                    elapsed = datetime.utcnow() - last_result.updated_at
+                    if elapsed.total_seconds() < 900:  # 15 minutes
+                        active_date = et_yesterday
+
+        # Step 2: Fetch schedule for the active date
+        schedule = await fetch_nhl_schedule(active_date)
+        games = parse_games_from_schedule(schedule, active_date)
+
+        # Step 3: If active_date had no games, fall back to the other date
+        if not games and active_date == et_yesterday:
+            active_date = et_today
+            schedule = await fetch_nhl_schedule(active_date)
+            games = parse_games_from_schedule(schedule, active_date)
+
         if not games:
-            yesterday_contest_id = int(yesterday.replace("-", ""))
-            yesterday_contract_data = await get_contract_data(yesterday_contest_id)
-
-            # If yesterday's contest exists and isn't settled, show it
-            if yesterday_contract_data.get("entrant_count", 0) > 0 and yesterday_contract_data.get("state") != "settled":
-                yesterday_schedule = await fetch_nhl_schedule(yesterday)
-                games = parse_games_from_schedule(yesterday_schedule, yesterday)
-                if games:
-                    # Use yesterday's date for the contest
-                    today = yesterday
-
-            if not games:
-                raise HTTPException(status_code=404, detail="No games scheduled today")
+            raise HTTPException(status_code=404, detail="No games scheduled today")
 
         # Lock time = 5 minutes before first puck drop
         lock_time = games[0].start_time - timedelta(minutes=5)
-        contest_id = int(today.replace("-", ""))
+        contest_id = int(active_date.replace("-", ""))
 
         # Store/update contest in database
         db = SessionLocal()
@@ -673,7 +702,7 @@ async def get_today_contest():
         if not contest_db:
             contest_db = ContestDB(
                 id=contest_id,
-                date=today,
+                date=active_date,
                 lock_time=lock_time,
                 games=games_json
             )
@@ -700,7 +729,7 @@ async def get_today_contest():
 
         return Contest(
             contest_id=contest_id,
-            date=today,
+            date=active_date,
             lock_time=lock_time,
             games=games,
             total_pot=contract_data["total_pot"],
