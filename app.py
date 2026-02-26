@@ -509,11 +509,13 @@ async def update_live_scores():
                         winner = 1 if game.home_score > game.away_score else 0
 
                         if existing:
-                            existing.home_score = game.home_score
-                            existing.away_score = game.away_score
-                            existing.winner = winner
-                            existing.is_final = True
-                            existing.updated_at = datetime.utcnow()
+                            # Only update updated_at when something actually changed
+                            if not existing.is_final or existing.home_score != game.home_score or existing.away_score != game.away_score:
+                                existing.home_score = game.home_score
+                                existing.away_score = game.away_score
+                                existing.winner = winner
+                                existing.is_final = True
+                                existing.updated_at = datetime.utcnow()
                         else:
                             db.add(GameResultDB(
                                 contest_id=contest_id,
@@ -660,21 +662,9 @@ async def get_today_contest():
 
         if yesterday_contract_data.get("entrant_count", 0) > 0:
             if yesterday_contract_data.get("state") != "settled":
-                # Has entries but not yet settled — keep showing yesterday
+                # Has entries but not yet settled (games live or settlement pending) — keep showing yesterday
                 active_date = et_yesterday
-            else:
-                # Settled — enforce 15-min cooldown before showing tomorrow's picks
-                db = SessionLocal()
-                last_result = db.query(GameResultDB).filter(
-                    GameResultDB.contest_id == yesterday_contest_id,
-                    GameResultDB.is_final == True
-                ).order_by(GameResultDB.updated_at.desc()).first()
-                db.close()
-
-                if last_result and last_result.updated_at:
-                    elapsed = datetime.utcnow() - last_result.updated_at
-                    if elapsed.total_seconds() < 900:  # 15 minutes
-                        active_date = et_yesterday
+            # If settled (prize already paid), fall through and show today's new games immediately
 
         # Step 2: Fetch schedule for the active date
         schedule = await fetch_nhl_schedule(active_date)
