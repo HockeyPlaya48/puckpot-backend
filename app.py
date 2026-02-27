@@ -925,6 +925,34 @@ async def manual_sync_scores():
     await sync_entries_from_blockchain()
     return {"message": "Scores and entries synced"}
 
+@app.post("/api/admin/create-today-contest")
+async def manual_create_contest():
+    """Manually trigger today's contest creation on-chain"""
+    if not CONTRACT_ADDRESS or not owner_account:
+        return {
+            "success": False,
+            "error": "CONTRACT_ADDRESS or OWNER_PRIVATE_KEY not configured in environment",
+            "contract_address_set": bool(CONTRACT_ADDRESS),
+            "private_key_set": bool(OWNER_PRIVATE_KEY),
+        }
+    await auto_create_daily_contest()
+    return {"success": True, "message": "Contest creation triggered — check logs for result"}
+
+@app.get("/api/admin/status")
+async def admin_status():
+    """Check backend config and today's on-chain contest status"""
+    today = get_et_date(0)
+    contest_id = int(today.replace("-", ""))
+    contract_data = await get_contract_data(contest_id)
+    return {
+        "contract_address_set": bool(CONTRACT_ADDRESS),
+        "private_key_set": bool(OWNER_PRIVATE_KEY),
+        "contract_address": CONTRACT_ADDRESS or None,
+        "today_contest_id": contest_id,
+        "contest_exists_on_chain": (contract_data.get("lock_time", 0) or 0) > 0,
+        "contest_data": contract_data,
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
