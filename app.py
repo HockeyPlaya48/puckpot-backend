@@ -526,6 +526,22 @@ async def update_live_scores():
                                 winner=winner,
                                 is_final=True
                             ))
+                    elif game.status == "POSTPONED":
+                        # Postponed games count as final (winner=2) so settlement can still fire
+                        if not existing:
+                            db.add(GameResultDB(
+                                contest_id=contest_id,
+                                game_index=game.game_index,
+                                nhl_game_id=game.nhl_game_id,
+                                home_score=0,
+                                away_score=0,
+                                winner=2,
+                                is_final=True
+                            ))
+                        elif not existing.is_final:
+                            existing.winner = 2
+                            existing.is_final = True
+                            existing.updated_at = datetime.utcnow()
 
                 db.commit()
             except Exception as e:
@@ -662,8 +678,24 @@ async def get_today_contest():
 
         if yesterday_contract_data.get("entrant_count", 0) > 0:
             if yesterday_contract_data.get("state") != "settled":
-                # Has entries but not yet settled (games live or settlement pending) — keep showing yesterday
-                active_date = et_yesterday
+                # Has entries but not yet settled — keep showing yesterday UNLESS
+                # it's been 10+ hours since lock time (games must be long over).
+                # This prevents the app getting stuck if settlement fails on-chain.
+                db_tmp = SessionLocal()
+                y_contest = db_tmp.query(ContestDB).filter(ContestDB.id == yesterday_contest_id).first()
+                db_tmp.close()
+
+                too_old = False
+                if y_contest and y_contest.lock_time:
+                    lt = y_contest.lock_time
+                    if lt.tzinfo is None:
+                        lt = lt.replace(tzinfo=timezone.utc)
+                    hours_since_lock = (datetime.now(timezone.utc) - lt).total_seconds() / 3600
+                    too_old = hours_since_lock >= 10  # 10 h covers even the latest games + buffer
+
+                if not too_old:
+                    active_date = et_yesterday
+                # else: fall through to today (settlement is overdue)
             # If settled (prize already paid), fall through and show today's new games immediately
 
         # Step 2: Fetch schedule for the active date
