@@ -927,7 +927,7 @@ async def manual_sync_scores():
 
 @app.post("/api/admin/create-today-contest")
 async def manual_create_contest():
-    """Manually trigger today's contest creation on-chain"""
+    """Manually trigger today's contest creation on-chain with detailed status"""
     if not CONTRACT_ADDRESS or not owner_account:
         return {
             "success": False,
@@ -935,8 +935,76 @@ async def manual_create_contest():
             "contract_address_set": bool(CONTRACT_ADDRESS),
             "private_key_set": bool(OWNER_PRIVATE_KEY),
         }
-    await auto_create_daily_contest()
-    return {"success": True, "message": "Contest creation triggered — check logs for result"}
+
+    today = get_et_date(0)
+    contest_id = int(today.replace("-", ""))
+
+    try:
+        # Check schedule
+        schedule = await fetch_nhl_schedule(today)
+        games = parse_games_from_schedule(schedule, today)
+        if not games:
+            return {"success": False, "error": f"No NHL games for {today}", "contest_id": contest_id}
+
+        # Check on-chain
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(CONTRACT_ADDRESS),
+            abi=PUCKPOT_ABI
+        )
+        try:
+            result = contract.functions.getContest(contest_id).call()
+            if result[0] > 0:
+                return {"success": False, "error": "Contest already exists on-chain", "lock_time": result[0], "contest_id": contest_id}
+        except Exception as ce:
+            pass  # doesn't exist, proceed
+
+        # Lock time
+        lock_time = games[0].start_time - timedelta(minutes=5)
+        lock_timestamp = int(lock_time.timestamp())
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+
+        if lock_timestamp <= now_ts:
+            return {"success": False, "error": f"Lock time already passed ({lock_time.isoformat()})", "contest_id": contest_id}
+
+        # Build + send tx
+        nonce = w3.eth.get_transaction_count(owner_account.address)
+        gas_price = w3.eth.gas_price
+        eth_balance = w3.eth.get_balance(owner_account.address)
+
+        tx = contract.functions.createContest(
+            contest_id,
+            lock_timestamp,
+            len(games)
+        ).build_transaction({
+            'from': owner_account.address,
+            'nonce': nonce,
+            'gas': 200000,
+            'gasPrice': max(gas_price * 2, 1000000),  # min 0.001 gwei
+            'chainId': 8453
+        })
+
+        signed_tx = w3.eth.account.sign_transaction(tx, owner_account.key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+
+        return {
+            "success": receipt.status == 1,
+            "tx_hash": tx_hash.hex(),
+            "status": "created" if receipt.status == 1 else "tx_reverted",
+            "contest_id": contest_id,
+            "lock_time": lock_time.isoformat(),
+            "num_games": len(games),
+            "owner_address": owner_account.address,
+            "eth_balance_wei": eth_balance,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "contest_id": contest_id,
+            "owner_address": owner_account.address if owner_account else None,
+        }
 
 @app.get("/api/admin/status")
 async def admin_status():
